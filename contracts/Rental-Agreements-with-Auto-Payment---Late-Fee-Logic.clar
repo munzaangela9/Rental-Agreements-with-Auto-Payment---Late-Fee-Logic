@@ -2,6 +2,11 @@
 (define-constant late-fee-percentage u5)
 (define-constant grace-period-blocks u144)
 (define-constant seconds-in-day u86400)
+(define-constant dispute-resolution-period u604800)
+
+(define-constant dispute-status-open u0)
+(define-constant dispute-status-resolved u1)
+(define-constant dispute-status-closed u2)
 
 (define-data-var last-payment-height uint u0)
 (define-data-var rental-amount uint u0)
@@ -29,6 +34,23 @@
         payments-made: uint,
     }
 )
+
+(define-map rental-disputes
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        dispute-type: (string-ascii 50),
+        description: (string-ascii 200),
+        amount: uint,
+        status: uint,
+        created-at: uint,
+        resolved-at: (optional uint),
+        winner: (optional principal),
+    }
+)
+
+(define-data-var dispute-counter uint u0)
 
 (define-public (create-rental-agreement
         (tenant principal)
@@ -142,4 +164,106 @@
         )
         (ok true)
     )
+)
+
+(define-public (create-dispute
+        (tenant principal)
+        (dispute-type (string-ascii 50))
+        (description (string-ascii 200))
+        (amount uint)
+    )
+    (let (
+            (rental-info (unwrap! (map-get? rental-agreements tenant) (err u500)))
+            (dispute-id (var-get dispute-counter))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts!
+            (or (is-eq tx-sender tenant) (is-eq tx-sender (get landlord rental-info)))
+            (err u501)
+        )
+        (asserts! (get active rental-info) (err u502))
+        (asserts! (> amount u0) (err u503))
+        (var-set dispute-counter (+ dispute-id u1))
+        (map-set rental-disputes dispute-id {
+            tenant: tenant,
+            landlord: (get landlord rental-info),
+            dispute-type: dispute-type,
+            description: description,
+            amount: amount,
+            status: dispute-status-open,
+            created-at: current-time,
+            resolved-at: none,
+            winner: none,
+        })
+        (ok dispute-id)
+    )
+)
+
+(define-public (resolve-dispute
+        (dispute-id uint)
+        (winner principal)
+    )
+    (let (
+            (dispute-info (unwrap! (map-get? rental-disputes dispute-id) (err u600)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (dispute-amount (get amount dispute-info))
+            (tenant (get tenant dispute-info))
+            (landlord (get landlord dispute-info))
+        )
+        (asserts! (is-eq tx-sender contract-owner) (err u601))
+        (asserts! (is-eq (get status dispute-info) dispute-status-open)
+            (err u602)
+        )
+        (asserts! (or (is-eq winner tenant) (is-eq winner landlord)) (err u603))
+        (asserts!
+            (< (- current-time (get created-at dispute-info))
+                dispute-resolution-period
+            )
+            (err u604)
+        )
+        (map-set rental-disputes dispute-id
+            (merge dispute-info {
+                status: dispute-status-resolved,
+                resolved-at: (some current-time),
+                winner: (some winner),
+            })
+        )
+        (if (is-eq winner tenant)
+            (try! (stx-transfer? dispute-amount landlord tenant))
+            (try! (stx-transfer? dispute-amount tenant landlord))
+        )
+        (ok true)
+    )
+)
+
+(define-public (close-expired-dispute (dispute-id uint))
+    (let (
+            (dispute-info (unwrap! (map-get? rental-disputes dispute-id) (err u700)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts! (is-eq (get status dispute-info) dispute-status-open)
+            (err u701)
+        )
+        (asserts!
+            (>= (- current-time (get created-at dispute-info))
+                dispute-resolution-period
+            )
+            (err u702)
+        )
+        (map-set rental-disputes dispute-id
+            (merge dispute-info {
+                status: dispute-status-closed,
+                resolved-at: (some current-time),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute-info (dispute-id uint))
+    (ok (map-get? rental-disputes dispute-id))
+)
+
+(define-read-only (get-active-disputes-count)
+    (ok (var-get dispute-counter))
 )
