@@ -8,6 +8,11 @@
 (define-constant dispute-status-resolved u1)
 (define-constant dispute-status-closed u2)
 
+(define-constant renewal-status-pending u0)
+(define-constant renewal-status-approved u1)
+(define-constant renewal-status-rejected u2)
+(define-constant renewal-eligibility-days u30)
+
 (define-data-var last-payment-height uint u0)
 (define-data-var rental-amount uint u0)
 (define-data-var payment-due-date uint u0)
@@ -51,6 +56,22 @@
 )
 
 (define-data-var dispute-counter uint u0)
+
+(define-map renewal-requests
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        current-rent: uint,
+        proposed-rent: uint,
+        new-duration: uint,
+        status: uint,
+        requested-at: uint,
+        reviewed-at: (optional uint),
+    }
+)
+
+(define-data-var renewal-counter uint u0)
 
 (define-public (create-rental-agreement
         (tenant principal)
@@ -266,4 +287,112 @@
 
 (define-read-only (get-active-disputes-count)
     (ok (var-get dispute-counter))
+)
+
+(define-public (request-renewal
+        (proposed-rent uint)
+        (new-duration uint)
+    )
+    (let (
+            (rental-info (unwrap! (map-get? rental-agreements tx-sender) (err u800)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (end-date (get end-date rental-info))
+            (renewal-id (var-get renewal-counter))
+            (eligibility-timestamp (- end-date (* renewal-eligibility-days seconds-in-day)))
+        )
+        (asserts! (get active rental-info) (err u801))
+        (asserts! (>= current-time eligibility-timestamp) (err u802))
+        (asserts! (> proposed-rent u0) (err u803))
+        (asserts! (> new-duration u0) (err u804))
+        (var-set renewal-counter (+ renewal-id u1))
+        (map-set renewal-requests renewal-id {
+            tenant: tx-sender,
+            landlord: (get landlord rental-info),
+            current-rent: (get rent-amount rental-info),
+            proposed-rent: proposed-rent,
+            new-duration: new-duration,
+            status: renewal-status-pending,
+            requested-at: current-time,
+            reviewed-at: none,
+        })
+        (ok renewal-id)
+    )
+)
+
+(define-public (review-renewal-request
+        (renewal-id uint)
+        (approved bool)
+        (final-rent uint)
+    )
+    (let (
+            (renewal-info (unwrap! (map-get? renewal-requests renewal-id) (err u900)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (tenant (get tenant renewal-info))
+            (rental-info (unwrap! (map-get? rental-agreements tenant) (err u901)))
+        )
+        (asserts! (is-eq tx-sender (get landlord renewal-info)) (err u902))
+        (asserts! (is-eq (get status renewal-info) renewal-status-pending)
+            (err u903)
+        )
+        (asserts! (> final-rent u0) (err u904))
+        (if approved
+            (begin
+                (map-set renewal-requests renewal-id
+                    (merge renewal-info {
+                        status: renewal-status-approved,
+                        reviewed-at: (some current-time),
+                        proposed-rent: final-rent,
+                    })
+                )
+                (map-set rental-agreements tenant
+                    (merge rental-info {
+                        rent-amount: final-rent,
+                        end-date: (+ (get end-date rental-info)
+                            (* (get new-duration renewal-info) seconds-in-day)
+                        ),
+                    })
+                )
+            )
+            (map-set renewal-requests renewal-id
+                (merge renewal-info {
+                    status: renewal-status-rejected,
+                    reviewed-at: (some current-time),
+                })
+            )
+        )
+        (ok approved)
+    )
+)
+
+(define-read-only (check-renewal-eligibility (tenant principal))
+    (let (
+            (rental-info (unwrap! (map-get? rental-agreements tenant) (err u1000)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (end-date (get end-date rental-info))
+            (eligibility-timestamp (- end-date (* renewal-eligibility-days seconds-in-day)))
+        )
+        (ok (and
+            (get active rental-info)
+            (>= current-time eligibility-timestamp)
+            (< current-time end-date)
+        ))
+    )
+)
+
+(define-read-only (get-renewal-request (renewal-id uint))
+    (ok (map-get? renewal-requests renewal-id))
+)
+
+(define-read-only (get-days-until-renewal-eligible (tenant principal))
+    (let (
+            (rental-info (unwrap! (map-get? rental-agreements tenant) (err u1100)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (end-date (get end-date rental-info))
+            (eligibility-timestamp (- end-date (* renewal-eligibility-days seconds-in-day)))
+        )
+        (if (>= current-time eligibility-timestamp)
+            (ok u0)
+            (ok (/ (- eligibility-timestamp current-time) seconds-in-day))
+        )
+    )
 )
