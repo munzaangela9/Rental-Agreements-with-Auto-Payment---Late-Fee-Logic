@@ -13,6 +13,14 @@
 (define-constant renewal-status-rejected u2)
 (define-constant renewal-eligibility-days u30)
 
+(define-constant maintenance-status-open u0)
+(define-constant maintenance-status-completed u1)
+(define-constant maintenance-status-cancelled u2)
+(define-constant maintenance-priority-low u1)
+(define-constant maintenance-priority-medium u2)
+(define-constant maintenance-priority-high u3)
+(define-constant maintenance-response-time u604800)
+
 (define-data-var last-payment-height uint u0)
 (define-data-var rental-amount uint u0)
 (define-data-var payment-due-date uint u0)
@@ -72,6 +80,33 @@
 )
 
 (define-data-var renewal-counter uint u0)
+
+(define-map maintenance-requests
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        issue-type: (string-ascii 50),
+        description: (string-ascii 300),
+        priority: uint,
+        status: uint,
+        escrow-amount: uint,
+        created-at: uint,
+        completed-at: (optional uint),
+    }
+)
+
+(define-data-var maintenance-counter uint u0)
+
+(define-map escrow-holdings
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        amount: uint,
+        released: bool,
+    }
+)
 
 (define-public (create-rental-agreement
         (tenant principal)
@@ -395,4 +430,166 @@
             (ok (/ (- eligibility-timestamp current-time) seconds-in-day))
         )
     )
+)
+
+(define-public (create-maintenance-request
+        (issue-type (string-ascii 50))
+        (description (string-ascii 300))
+        (priority uint)
+        (escrow-amount uint)
+    )
+    (let (
+            (rental-info (unwrap! (map-get? rental-agreements tx-sender) (err u1200)))
+            (maintenance-id (var-get maintenance-counter))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts! (get active rental-info) (err u1201))
+        (asserts!
+            (or
+                (is-eq priority maintenance-priority-low)
+                (or
+                    (is-eq priority maintenance-priority-medium)
+                    (is-eq priority maintenance-priority-high)
+                )
+            )
+            (err u1202)
+        )
+        (asserts! (>= escrow-amount u0) (err u1203))
+        (if (> escrow-amount u0)
+            (begin
+                (try! (stx-transfer? escrow-amount tx-sender (as-contract tx-sender)))
+                (map-set escrow-holdings maintenance-id {
+                    tenant: tx-sender,
+                    landlord: (get landlord rental-info),
+                    amount: escrow-amount,
+                    released: false,
+                })
+            )
+            true
+        )
+        (var-set maintenance-counter (+ maintenance-id u1))
+        (map-set maintenance-requests maintenance-id {
+            tenant: tx-sender,
+            landlord: (get landlord rental-info),
+            issue-type: issue-type,
+            description: description,
+            priority: priority,
+            status: maintenance-status-open,
+            escrow-amount: escrow-amount,
+            created-at: current-time,
+            completed-at: none,
+        })
+        (ok maintenance-id)
+    )
+)
+
+(define-public (complete-maintenance-request (maintenance-id uint))
+    (let (
+            (maintenance-info (unwrap! (map-get? maintenance-requests maintenance-id) (err u1300)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (escrow-amount (get escrow-amount maintenance-info))
+        )
+        (asserts! (is-eq tx-sender (get landlord maintenance-info)) (err u1301))
+        (asserts! (is-eq (get status maintenance-info) maintenance-status-open)
+            (err u1302)
+        )
+        (map-set maintenance-requests maintenance-id
+            (merge maintenance-info {
+                status: maintenance-status-completed,
+                completed-at: (some current-time),
+            })
+        )
+        (if (> escrow-amount u0)
+            (begin
+                (let ((escrow-info (unwrap! (map-get? escrow-holdings maintenance-id)
+                        (err u1303)
+                    )))
+                    (asserts! (not (get released escrow-info)) (err u1304))
+                    (try! (as-contract (stx-transfer? escrow-amount tx-sender
+                        (get landlord maintenance-info)
+                    )))
+                    (map-set escrow-holdings maintenance-id
+                        (merge escrow-info { released: true })
+                    )
+                    (ok true)
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (cancel-maintenance-request (maintenance-id uint))
+    (let (
+            (maintenance-info (unwrap! (map-get? maintenance-requests maintenance-id) (err u1400)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (escrow-amount (get escrow-amount maintenance-info))
+        )
+        (asserts! (is-eq tx-sender (get tenant maintenance-info)) (err u1401))
+        (asserts! (is-eq (get status maintenance-info) maintenance-status-open)
+            (err u1402)
+        )
+        (map-set maintenance-requests maintenance-id
+            (merge maintenance-info {
+                status: maintenance-status-cancelled,
+                completed-at: (some current-time),
+            })
+        )
+        (if (> escrow-amount u0)
+            (begin
+                (let ((escrow-info (unwrap! (map-get? escrow-holdings maintenance-id)
+                        (err u1403)
+                    )))
+                    (asserts! (not (get released escrow-info)) (err u1404))
+                    (try! (as-contract (stx-transfer? escrow-amount tx-sender
+                        (get tenant maintenance-info)
+                    )))
+                    (map-set escrow-holdings maintenance-id
+                        (merge escrow-info { released: true })
+                    )
+                    (ok true)
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (release-escrow-to-tenant (maintenance-id uint))
+    (let (
+            (maintenance-info (unwrap! (map-get? maintenance-requests maintenance-id) (err u1500)))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (escrow-info (unwrap! (map-get? escrow-holdings maintenance-id) (err u1501)))
+        )
+        (asserts! (is-eq tx-sender contract-owner) (err u1502))
+        (asserts! (is-eq (get status maintenance-info) maintenance-status-open)
+            (err u1503)
+        )
+        (asserts!
+            (>= (- current-time (get created-at maintenance-info))
+                maintenance-response-time
+            )
+            (err u1504)
+        )
+        (asserts! (not (get released escrow-info)) (err u1505))
+        (try! (as-contract (stx-transfer? (get amount escrow-info) tx-sender
+            (get tenant maintenance-info)
+        )))
+        (map-set escrow-holdings maintenance-id
+            (merge escrow-info { released: true })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-maintenance-request (maintenance-id uint))
+    (ok (map-get? maintenance-requests maintenance-id))
+)
+
+(define-read-only (get-escrow-status (maintenance-id uint))
+    (ok (map-get? escrow-holdings maintenance-id))
+)
+
+(define-read-only (get-total-maintenance-requests)
+    (ok (var-get maintenance-counter))
 )
