@@ -593,3 +593,94 @@
 (define-read-only (get-total-maintenance-requests)
     (ok (var-get maintenance-counter))
 )
+
+(define-map autopay-authorizations
+    principal
+    {
+        landlord: principal,
+        max-amount: uint,
+        active: bool,
+    }
+)
+
+(define-map autopay-balances
+    principal
+    { amount: uint }
+)
+
+(define-public (autopay-authorize
+        (landlord principal)
+        (max-amount uint)
+    )
+    (begin
+        (asserts! (> max-amount u0) (err u7001))
+        (map-set autopay-authorizations tx-sender {
+            landlord: landlord,
+            max-amount: max-amount,
+            active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (autopay-revoke)
+    (let ((auth (default-to {
+            landlord: tx-sender,
+            max-amount: u0,
+            active: false,
+        }
+            (map-get? autopay-authorizations tx-sender)
+        )))
+        (map-set autopay-authorizations tx-sender (merge auth { active: false }))
+        (ok true)
+    )
+)
+
+(define-public (autopay-fund (amount uint))
+    (let ((bal (default-to { amount: u0 } (map-get? autopay-balances tx-sender))))
+        (asserts! (> amount u0) (err u7002))
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set autopay-balances tx-sender { amount: (+ (get amount bal) amount) })
+        (ok true)
+    )
+)
+
+(define-public (autopay-withdraw (amount uint))
+    (let (
+            (bal (default-to { amount: u0 } (map-get? autopay-balances tx-sender)))
+            (recipient tx-sender)
+        )
+        (asserts! (> amount u0) (err u7003))
+        (asserts! (>= (get amount bal) amount) (err u7004))
+        (map-set autopay-balances tx-sender { amount: (- (get amount bal) amount) })
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        (ok true)
+    )
+)
+
+(define-public (autopay-execute
+        (tenant principal)
+        (amount uint)
+    )
+    (let (
+            (auth (unwrap! (map-get? autopay-authorizations tenant) (err u7005)))
+            (bal (default-to { amount: u0 } (map-get? autopay-balances tenant)))
+            (recipient tx-sender)
+        )
+        (asserts! (is-eq recipient (get landlord auth)) (err u7006))
+        (asserts! (get active auth) (err u7007))
+        (asserts! (> amount u0) (err u7008))
+        (asserts! (<= amount (get max-amount auth)) (err u7009))
+        (asserts! (>= (get amount bal) amount) (err u7010))
+        (map-set autopay-balances tenant { amount: (- (get amount bal) amount) })
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-autopay-status (tenant principal))
+    (ok {
+        settings: (map-get? autopay-authorizations tenant),
+        balance: (map-get? autopay-balances tenant),
+    })
+)
